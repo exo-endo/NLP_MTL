@@ -1,0 +1,56 @@
+# Python virtual environment
+hless/
+app/__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+generate_wordclouds.py
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Model checkpoints (optional - uncomment if you don't want to track models)
+# models/*/checkpoint-*/
+# *.safetensors
+# *.bin
+
+# Data files (optional - uncomment if data is too large)
+# Data/*.csv
+# Data/*.json
+
+# Logs
+*.log
+train_run.log
+wordcloud_run.log
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
+
+# Temporary files
+*.tmp
+temp/
+tmp/
+
+# Generated outputs (can be regenerated)
+wordclouds/
+
+# Environment variables
+.env
+.env.local
+
+Data/
+models/
+hf_models/
+
