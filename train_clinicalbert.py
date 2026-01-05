@@ -8,6 +8,13 @@ os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 # Optional: point HF cache somewhere writable
 # os.environ["HF_HOME"] = "/path/to/hf_cache"
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="torch")
+warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
+
+
 import argparse
 import datetime
 import pandas as pd
@@ -265,10 +272,11 @@ def main(data_csv: str, out_dir: str, model_source: str, epochs: int):
     training_args = TrainingArguments(
         output_dir=out_dir,
         num_train_epochs=epochs,
+        dataloader_pin_memory=False,
         per_device_train_batch_size=8,
         per_device_eval_batch_size=16,
         learning_rate=2e-5,
-        logging_steps=50,
+        logging_steps=250,
         eval_strategy="epoch",  # fixed parameter name
         save_strategy="epoch",
         save_total_limit=1,
