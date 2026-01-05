@@ -13,9 +13,10 @@ import datetime
 import pandas as pd
 import torch
 import torch.nn as nn
+import numpy as np  # NEW
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, confusion_matrix  # NEW
 from datasets import Dataset
 from transformers import (
     AutoTokenizer,
@@ -29,7 +30,15 @@ from transformers import (
 # Multi-task ClinicalBERT model
 # --------------------------------------------------
 class ClinicalBERT_MTL(nn.Module):
-    def __init__(self, model_source: str, num_labels: int = 3, local_only: bool = True):
+    def __init__(
+        self,
+        model_source: str,
+        num_labels: int = 3,
+        local_only: bool = True,
+        env_weights=None,   # NEW
+        edu_weights=None,   # NEW
+        econ_weights=None,  # NEW
+    ):
         """
         model_source: local directory path containing config.json, tokenizer files, model weights, etc.
                     e.g. "/models/Bio_ClinicalBERT"
@@ -52,7 +61,10 @@ class ClinicalBERT_MTL(nn.Module):
         self.education   = nn.Linear(hidden, num_labels)
         self.economics   = nn.Linear(hidden, num_labels)
 
-        self.loss_fn = nn.CrossEntropyLoss()
+        # NEW: store weights as buffers so they move with model.to(device)
+        self.register_buffer("env_weights", env_weights if env_weights is not None else None, persistent=False)
+        self.register_buffer("edu_weights", edu_weights if edu_weights is not None else None, persistent=False)
+        self.register_buffer("econ_weights", econ_weights if econ_weights is not None else None, persistent=False)
 
     def forward(
         self,
@@ -75,11 +87,17 @@ class ClinicalBERT_MTL(nn.Module):
 
         loss = None
         if environment_label is not None:
-            loss = (
-                self.loss_fn(logits_env, environment_label)
-                + self.loss_fn(logits_edu, education_label)
-                + self.loss_fn(logits_econ, economics_label)
-            )
+            # NEW: class-weighted CE per head (falls back to unweighted if weights are None)
+            loss_env = nn.CrossEntropyLoss(weight=self.env_weights)(logits_env, environment_label) \
+                if self.env_weights is not None else nn.CrossEntropyLoss()(logits_env, environment_label)
+
+            loss_edu = nn.CrossEntropyLoss(weight=self.edu_weights)(logits_edu, education_label) \
+                if self.edu_weights is not None else nn.CrossEntropyLoss()(logits_edu, education_label)
+
+            loss_econ = nn.CrossEntropyLoss(weight=self.econ_weights)(logits_econ, economics_label) \
+                if self.econ_weights is not None else nn.CrossEntropyLoss()(logits_econ, economics_label)
+
+            loss = loss_env + loss_edu + loss_econ
 
         return {
             "loss": loss,
@@ -87,6 +105,24 @@ class ClinicalBERT_MTL(nn.Module):
             "logits_edu": logits_edu,
             "logits_econ": logits_econ,
         }
+
+
+# NEW: class-weight helper
+def compute_class_weights(series, num_classes=3):
+    counts = series.value_counts().reindex(range(num_classes), fill_value=0).to_numpy(dtype=np.float32)
+    counts = np.maximum(counts, 1.0)  # avoid div-by-zero
+    weights = counts.sum() / counts   # inverse frequency
+    weights = weights / weights.mean()  # normalize
+    return torch.tensor(weights, dtype=torch.float32), counts.astype(int)
+
+
+# NEW: pretty confusion matrix formatting
+def format_cm(cm):
+    lines = []
+    lines.append("        pred0  pred1  pred2")
+    for i, row in enumerate(cm):
+        lines.append(f"true{i}  {row[0]:>6} {row[1]:>6} {row[2]:>6}")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------
@@ -143,6 +179,11 @@ def main(data_csv: str, out_dir: str, model_source: str, epochs: int):
         stratify=df["environment_label"],  # anchor on one task
     )
 
+    # NEW: compute per-head weights from TRAIN split only
+    w_env, env_counts   = compute_class_weights(train_df["environment_label"])
+    w_edu, edu_counts   = compute_class_weights(train_df["education_label"])
+    w_econ, econ_counts = compute_class_weights(train_df["economics_label"])
+
     train_dataset = Dataset.from_pandas(train_df.reset_index(drop=True))
     test_dataset  = Dataset.from_pandas(test_df.reset_index(drop=True))
 
@@ -184,10 +225,18 @@ def main(data_csv: str, out_dir: str, model_source: str, epochs: int):
     # ----------------------------
     # Model (LOCAL)
     # ----------------------------
-    model = ClinicalBERT_MTL(model_source=model_source, num_labels=3, local_only=True)
+    # NEW: pass weights into model
+    model = ClinicalBERT_MTL(
+        model_source=model_source,
+        num_labels=3,
+        local_only=True,
+        env_weights=w_env,
+        edu_weights=w_edu,
+        econ_weights=w_econ,
+    )
 
     # ----------------------------
-    # Metrics
+    # Metrics (keep minimal: accuracy only)
     # ----------------------------
     def compute_metrics(eval_pred):
         preds, labels = eval_pred
@@ -220,7 +269,7 @@ def main(data_csv: str, out_dir: str, model_source: str, epochs: int):
         per_device_eval_batch_size=16,
         learning_rate=2e-5,
         logging_steps=50,
-        eval_strategy="epoch",
+        eval_strategy="epoch",  # fixed parameter name
         save_strategy="epoch",
         save_total_limit=1,
         report_to="none",
@@ -280,10 +329,54 @@ def main(data_csv: str, out_dir: str, model_source: str, epochs: int):
     trainer.save_model(out_dir)
     print("Saved MTL ClinicalBERT to:", out_dir)
 
-    with open("log.txt", "a") as f:
-        f.write(
-            f"{datetime.datetime.now().isoformat()} | epochs={epochs} | {res}\n"
-        )
+    # ----------------------------
+    # NEW: write one timestamped eval log + confusion matrices at the end
+    # ----------------------------
+    pred_out = trainer.predict(test_dataset)
+    logits_env, logits_edu, logits_econ = pred_out.predictions
+    y_env, y_edu, y_econ = pred_out.label_ids
+
+    p_env  = np.argmax(logits_env, axis=-1)
+    p_edu  = np.argmax(logits_edu, axis=-1)
+    p_econ = np.argmax(logits_econ, axis=-1)
+
+    cm_env  = confusion_matrix(y_env,  p_env,  labels=[0, 1, 2]).tolist()
+    cm_edu  = confusion_matrix(y_edu,  p_edu,  labels=[0, 1, 2]).tolist()
+    cm_econ = confusion_matrix(y_econ, p_econ, labels=[0, 1, 2]).tolist()
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(out_dir, f"eval_{ts}.txt")
+
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(f"Timestamp: {datetime.datetime.now().isoformat()}\n")
+        f.write(f"Data: {data_csv}\n")
+        f.write(f"Model source: {model_source}\n")
+        f.write(f"Output dir: {out_dir}\n")
+        f.write(f"Epochs: {epochs}\n\n")
+
+        f.write("Train label counts (0/1/2):\n")
+        f.write(f"  env:  {env_counts.tolist()}\n")
+        f.write(f"  edu:  {edu_counts.tolist()}\n")
+        f.write(f"  econ: {econ_counts.tolist()}\n\n")
+
+        f.write("Class weights:\n")
+        f.write(f"  env:  {w_env.tolist()}\n")
+        f.write(f"  edu:  {w_edu.tolist()}\n")
+        f.write(f"  econ: {w_econ.tolist()}\n\n")
+
+        f.write("Final eval metrics:\n")
+        for k in sorted(res.keys()):
+            f.write(f"  {k}: {res[k]}\n")
+
+        f.write("\nConfusion matrices (rows=true, cols=pred):\n\n")
+        f.write("[ENV]\n")
+        f.write(format_cm(cm_env) + "\n\n")
+        f.write("[EDU]\n")
+        f.write(format_cm(cm_edu) + "\n\n")
+        f.write("[ECON]\n")
+        f.write(format_cm(cm_econ) + "\n")
+
+    print("Wrote eval summary to:", log_path)
 
 
 # --------------------------------------------------
